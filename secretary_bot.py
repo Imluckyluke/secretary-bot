@@ -13,6 +13,9 @@ from datetime import datetime
 from aiohttp import web
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import (
     Message,
     BusinessConnection,
@@ -35,7 +38,14 @@ PORT = int(os.environ.get("PORT", 8080))
 DB_PATH = "/data/backup.db" if os.path.isdir("/data") else "backup.db"
 
 bot = Bot(token=BOT_TOKEN)
-dp = Dispatcher()
+dp = Dispatcher(storage=MemoryStorage())
+
+
+class KeywordSetup(StatesGroup):
+    waiting_keyword = State()
+    confirm_keyword = State()
+    waiting_reply = State()
+    confirm_reply = State()
 
 
 def db():
@@ -55,6 +65,13 @@ def db():
         )
     """)
     conn.execute("CREATE INDEX IF NOT EXISTS idx_chat ON messages(chat_id)")
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS keywords (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            keyword TEXT NOT NULL,
+            reply_text TEXT NOT NULL
+        )
+    """)
     return conn
 
 
@@ -158,7 +175,114 @@ async def on_business_message(message: Message):
         except Exception as e:
             logging.error(f"Failed to relay media: {e}")
 
+    if text and (not message.from_user or message.from_user.id != OWNER_ID):
+        kconn = db()
+        krows = kconn.execute("SELECT keyword, reply_text FROM keywords").fetchall()
+        kconn.close()
+        for keyword, reply_text in krows:
+            if keyword.lower() in text.lower():
+                try:
+                    await bot.send_message(
+                        chat_id=message.chat.id,
+                        text=reply_text,
+                        business_connection_id=message.business_connection_id,
+                    )
+                except Exception as e:
+                    logging.error(f"Failed to send keyword auto-reply: {e}")
+                break
 
+
+
+
+def is_owner_in_group(message: Message) -> bool:
+    return message.chat.id == BACKUP_GROUP_ID and message.from_user.id == OWNER_ID
+
+
+@dp.message(F.text == "تنظیم کیورد")
+async def start_keyword_setup(message: Message, state: FSMContext):
+    if not is_owner_in_group(message):
+        return
+    prompt = await message.answer("پیامی که می‌خوای کیورد باشه رو روی همین پیام ریپلای کن.")
+    await state.set_state(KeywordSetup.waiting_keyword)
+    await state.update_data(prompt_id=prompt.message_id)
+
+
+@dp.message(KeywordSetup.waiting_keyword)
+async def receive_keyword(message: Message, state: FSMContext):
+    if not is_owner_in_group(message):
+        return
+    data = await state.get_data()
+    if not message.reply_to_message or message.reply_to_message.message_id != data.get("prompt_id"):
+        return
+    if not message.text:
+        await message.answer("فقط متن قابل قبوله.")
+        return
+
+    await state.update_data(keyword=message.text)
+    builder = InlineKeyboardBuilder()
+    builder.row(
+        InlineKeyboardButton(text="✅ تایید", callback_data="kw_confirm_keyword"),
+        InlineKeyboardButton(text="❌ رد", callback_data="kw_cancel"),
+    )
+    await message.answer(
+        f"این کیورد تنظیم بشه؟\n«{message.text}»",
+        reply_markup=builder.as_markup(),
+    )
+    await state.set_state(KeywordSetup.confirm_keyword)
+
+
+@dp.callback_query(F.data == "kw_confirm_keyword", KeywordSetup.confirm_keyword)
+async def confirm_keyword(callback: CallbackQuery, state: FSMContext):
+    prompt = await callback.message.answer("حالا پیامی که می‌خوای در جواب این کیورد ارسال بشه رو روی همین پیام ریپلای کن.")
+    await state.update_data(prompt_id=prompt.message_id)
+    await state.set_state(KeywordSetup.waiting_reply)
+    await callback.answer()
+
+
+@dp.message(KeywordSetup.waiting_reply)
+async def receive_reply_text(message: Message, state: FSMContext):
+    if not is_owner_in_group(message):
+        return
+    data = await state.get_data()
+    if not message.reply_to_message or message.reply_to_message.message_id != data.get("prompt_id"):
+        return
+    if not message.text:
+        await message.answer("فقط متن قابل قبوله.")
+        return
+
+    await state.update_data(reply_text=message.text)
+    builder = InlineKeyboardBuilder()
+    builder.row(
+        InlineKeyboardButton(text="✅ تایید", callback_data="kw_confirm_reply"),
+        InlineKeyboardButton(text="❌ رد", callback_data="kw_cancel"),
+    )
+    await message.answer(
+        f"کیورد: «{data.get('keyword')}»\nپاسخ: «{message.text}»\nتایید می‌کنی؟",
+        reply_markup=builder.as_markup(),
+    )
+    await state.set_state(KeywordSetup.confirm_reply)
+
+
+@dp.callback_query(F.data == "kw_confirm_reply", KeywordSetup.confirm_reply)
+async def confirm_reply(callback: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    conn = db()
+    conn.execute(
+        "INSERT INTO keywords (keyword, reply_text) VALUES (?, ?)",
+        (data.get("keyword"), data.get("reply_text")),
+    )
+    conn.commit()
+    conn.close()
+    await state.clear()
+    await callback.message.answer("اتومیشن تنظیم شد ✅")
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "kw_cancel")
+async def cancel_keyword_setup(callback: CallbackQuery, state: FSMContext):
+    await state.clear()
+    await callback.message.answer("لغو شد ❌")
+    await callback.answer()
 
 
 @dp.message(Command("backup"))
