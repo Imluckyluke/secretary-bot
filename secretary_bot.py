@@ -49,6 +49,8 @@ def db():
             sender_name TEXT,
             sender_username TEXT,
             text TEXT,
+            media_type TEXT,
+            file_id TEXT,
             ts TEXT
         )
     """)
@@ -81,9 +83,37 @@ async def on_business_connection(conn: BusinessConnection):
 @dp.business_message()
 async def on_business_message(message: Message):
     text = message.text or message.caption or ""
+
+    media_type = None
+    file_id = None
+    if message.photo:
+        media_type = "photo"
+        file_id = message.photo[-1].file_id
+    elif message.video:
+        media_type = "video"
+        file_id = message.video.file_id
+    elif message.voice:
+        media_type = "voice"
+        file_id = message.voice.file_id
+    elif message.audio:
+        media_type = "audio"
+        file_id = message.audio.file_id
+    elif message.document:
+        media_type = "document"
+        file_id = message.document.file_id
+    elif message.video_note:
+        media_type = "video_note"
+        file_id = message.video_note.file_id
+    elif message.sticker:
+        media_type = "sticker"
+        file_id = message.sticker.file_id
+    elif message.animation:
+        media_type = "animation"
+        file_id = message.animation.file_id
+
     conn = db()
     conn.execute(
-        "INSERT INTO messages (chat_id, chat_name, sender_id, sender_name, sender_username, text, ts) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        "INSERT INTO messages (chat_id, chat_name, sender_id, sender_name, sender_username, text, media_type, file_id, ts) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (
             message.chat.id,
             chat_display_name(message),
@@ -91,11 +121,42 @@ async def on_business_message(message: Message):
             sender_display_name(message),
             message.from_user.username if message.from_user else None,
             text,
+            media_type,
+            file_id,
             message.date.isoformat() if message.date else datetime.utcnow().isoformat(),
         ),
     )
     conn.commit()
     conn.close()
+
+    if media_type and file_id:
+        caption = (
+            f"{chat_display_name(message)} (ID: {message.chat.id})\n"
+            f"از: {sender_display_name(message)}"
+            + (f" (@{message.from_user.username})" if message.from_user and message.from_user.username else "")
+            + (f"\n{text}" if text else "")
+        )
+        send_map = {
+            "photo": bot.send_photo,
+            "video": bot.send_video,
+            "voice": bot.send_voice,
+            "audio": bot.send_audio,
+            "document": bot.send_document,
+            "video_note": None,
+            "sticker": bot.send_sticker,
+            "animation": bot.send_animation,
+        }
+        try:
+            if media_type == "video_note":
+                await bot.send_video_note(chat_id=BACKUP_GROUP_ID, video_note=file_id)
+                await bot.send_message(chat_id=BACKUP_GROUP_ID, text=caption)
+            elif media_type == "sticker":
+                await bot.send_sticker(chat_id=BACKUP_GROUP_ID, sticker=file_id)
+                await bot.send_message(chat_id=BACKUP_GROUP_ID, text=caption)
+            else:
+                await send_map[media_type](chat_id=BACKUP_GROUP_ID, **{media_type: file_id}, caption=caption)
+        except Exception as e:
+            logging.error(f"Failed to relay media: {e}")
 
 
 
@@ -134,7 +195,7 @@ async def on_backup_click(callback: CallbackQuery):
 
     conn = db()
     rows = conn.execute(
-        "SELECT chat_name, sender_name, sender_username, text, ts FROM messages WHERE chat_id = ? ORDER BY ts",
+        "SELECT chat_name, sender_name, sender_username, text, media_type, ts FROM messages WHERE chat_id = ? ORDER BY ts",
         (chat_id,),
     ).fetchall()
     conn.close()
@@ -145,13 +206,14 @@ async def on_backup_click(callback: CallbackQuery):
 
     chat_name = rows[0][0]
     lines = [f"===== {chat_name} (ID: {chat_id}) ====="]
-    for _, sender_name, sender_username, text, ts in rows:
+    for _, sender_name, sender_username, text, media_type, ts in rows:
         try:
             ts_fmt = datetime.fromisoformat(ts).strftime("%Y-%m-%d %H:%M")
         except ValueError:
             ts_fmt = ts
         uname = f" (@{sender_username})" if sender_username else ""
-        lines.append(f"[{ts_fmt}] {sender_name}{uname}: {text}")
+        content = f"[{media_type}] {text}".strip() if media_type else text
+        lines.append(f"[{ts_fmt}] {sender_name}{uname}: {content}")
 
     safe_name = "".join(c for c in chat_name if c.isalnum() or c in " _-").strip() or str(chat_id)
     filename = f"backup_{safe_name}_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.txt"
