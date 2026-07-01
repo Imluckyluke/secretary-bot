@@ -11,9 +11,16 @@ import sqlite3
 from datetime import datetime
 
 from aiohttp import web
-from aiogram import Bot, Dispatcher
+from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command
-from aiogram.types import Message, BusinessConnection, FSInputFile
+from aiogram.types import (
+    Message,
+    BusinessConnection,
+    FSInputFile,
+    CallbackQuery,
+    InlineKeyboardButton,
+)
+from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
 
 logging.basicConfig(level=logging.INFO)
@@ -40,6 +47,7 @@ def db():
             chat_name TEXT,
             sender_id INTEGER,
             sender_name TEXT,
+            sender_username TEXT,
             text TEXT,
             ts TEXT
         )
@@ -75,12 +83,13 @@ async def on_business_message(message: Message):
     text = message.text or message.caption or ""
     conn = db()
     conn.execute(
-        "INSERT INTO messages (chat_id, chat_name, sender_id, sender_name, text, ts) VALUES (?, ?, ?, ?, ?, ?)",
+        "INSERT INTO messages (chat_id, chat_name, sender_id, sender_name, sender_username, text, ts) VALUES (?, ?, ?, ?, ?, ?, ?)",
         (
             message.chat.id,
             chat_display_name(message),
             message.from_user.id if message.from_user else None,
             sender_display_name(message),
+            message.from_user.username if message.from_user else None,
             text,
             message.date.isoformat() if message.date else datetime.utcnow().isoformat(),
         ),
@@ -95,33 +104,57 @@ async def on_business_message(message: Message):
 async def cmd_backup(message: Message):
     if message.from_user.id != OWNER_ID:
         return
+    if message.chat.id != BACKUP_GROUP_ID:
+        return
+
+    conn = db()
+    chats = conn.execute(
+        "SELECT DISTINCT chat_id, chat_name FROM messages ORDER BY chat_name COLLATE NOCASE"
+    ).fetchall()
+    conn.close()
+
+    if not chats:
+        await message.answer("هنوز پیامی ذخیره نشده.")
+        return
+
+    builder = InlineKeyboardBuilder()
+    for chat_id, chat_name in chats:
+        builder.row(InlineKeyboardButton(text=chat_name, callback_data=f"backup:{chat_id}"))
+
+    await message.answer("کاربر مورد نظر رو انتخاب کن:", reply_markup=builder.as_markup())
+
+
+@dp.callback_query(F.data.startswith("backup:"))
+async def on_backup_click(callback: CallbackQuery):
+    if callback.from_user.id != OWNER_ID:
+        await callback.answer("⛔", show_alert=True)
+        return
+
+    chat_id = int(callback.data.split(":", 1)[1])
 
     conn = db()
     rows = conn.execute(
-        "SELECT chat_id, chat_name, sender_name, text, ts FROM messages ORDER BY chat_name COLLATE NOCASE, chat_id, ts"
+        "SELECT chat_name, sender_name, sender_username, text, ts FROM messages WHERE chat_id = ? ORDER BY ts",
+        (chat_id,),
     ).fetchall()
     conn.close()
 
     if not rows:
-        await message.answer("هنوز پیامی ذخیره نشده.")
+        await callback.answer("پیامی یافت نشد.", show_alert=True)
         return
 
-    lines = []
-    current_chat = None
-    for chat_id, chat_name, sender_name, text, ts in rows:
-        key = (chat_name, chat_id)
-        if key != current_chat:
-            if current_chat is not None:
-                lines.append("")
-            lines.append(f"===== {chat_name} (ID: {chat_id}) =====")
-            current_chat = key
+    chat_name = rows[0][0]
+    lines = [f"===== {chat_name} (ID: {chat_id}) ====="]
+    for _, sender_name, sender_username, text, ts in rows:
         try:
             ts_fmt = datetime.fromisoformat(ts).strftime("%Y-%m-%d %H:%M")
         except ValueError:
             ts_fmt = ts
-        lines.append(f"[{ts_fmt}] {sender_name}: {text}")
+        uname = f" (@{sender_username})" if sender_username else ""
+        lines.append(f"[{ts_fmt}] {sender_name}{uname}: {text}")
 
-    filename = f"backup_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.txt"
+    safe_name = "".join(c for c in chat_name if c.isalnum() or c in " _-").strip() or str(chat_id)
+    filename = f"backup_{safe_name}_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.txt"
     filepath = f"/tmp/{filename}"
     with open(filepath, "w", encoding="utf-8") as f:
         f.write("\n".join(lines))
@@ -129,9 +162,9 @@ async def cmd_backup(message: Message):
     await bot.send_document(
         chat_id=BACKUP_GROUP_ID,
         document=FSInputFile(filepath, filename=filename),
-        caption=f"بکاپ چت‌ها — {len(rows)} پیام",
+        caption=f"بکاپ {chat_name} — {len(rows)} پیام",
     )
-    await message.answer("بکاپ ارسال شد ✅")
+    await callback.answer("ارسال شد ✅")
 
 
 async def on_startup(app: web.Application):
