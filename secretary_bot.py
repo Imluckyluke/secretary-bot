@@ -325,6 +325,98 @@ async def cancel_keyword_setup(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
 
 
+def build_keyword_list_markup(rows):
+    builder = InlineKeyboardBuilder()
+    for kw_id, keyword, _ in rows:
+        builder.row(InlineKeyboardButton(text=keyword, callback_data=f"kwv:{kw_id}"))
+    return builder.as_markup()
+
+
+def build_keyword_item_markup(kw_id: int):
+    builder = InlineKeyboardBuilder()
+    builder.row(InlineKeyboardButton(text="🗑 حذف کیورد", callback_data=f"kwdel:{kw_id}"))
+    builder.row(InlineKeyboardButton(text="⬅️ برگشت", callback_data="kwback"))
+    return builder.as_markup()
+
+
+@dp.message(F.text == "لیست کیورد")
+async def list_keywords(message: Message):
+    if not is_owner_in_group(message):
+        return
+
+    conn = db()
+    rows = conn.execute("SELECT id, keyword, reply_text FROM keywords ORDER BY id").fetchall()
+    conn.close()
+
+    if not rows:
+        await message.answer("هنوز کیوردی ثبت نشده.")
+        return
+
+    await message.answer("کیورد مورد نظر رو انتخاب کن:", reply_markup=build_keyword_list_markup(rows))
+
+
+@dp.callback_query(F.data.startswith("kwv:"))
+async def on_keyword_view(callback: CallbackQuery):
+    if callback.from_user.id != OWNER_ID:
+        await callback.answer("⛔", show_alert=True)
+        return
+
+    kw_id = int(callback.data.split(":", 1)[1])
+
+    conn = db()
+    row = conn.execute("SELECT id, keyword, reply_text FROM keywords WHERE id = ?", (kw_id,)).fetchone()
+    conn.close()
+
+    if not row:
+        await callback.answer("این کیورد دیگه وجود نداره.", show_alert=True)
+        return
+
+    _, keyword, reply_text = row
+    await callback.message.edit_text(
+        f"کیورد: «{keyword}»\nپاسخ: «{reply_text}»",
+        reply_markup=build_keyword_item_markup(kw_id),
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("kwdel:"))
+async def on_keyword_delete(callback: CallbackQuery):
+    if callback.from_user.id != OWNER_ID:
+        await callback.answer("⛔", show_alert=True)
+        return
+
+    kw_id = int(callback.data.split(":", 1)[1])
+
+    conn = db()
+    conn.execute("DELETE FROM keywords WHERE id = ?", (kw_id,))
+    conn.commit()
+    rows = conn.execute("SELECT id, keyword, reply_text FROM keywords ORDER BY id").fetchall()
+    conn.close()
+
+    if not rows:
+        await callback.message.edit_text("هنوز کیوردی ثبت نشده.")
+    else:
+        await callback.message.edit_text("کیورد مورد نظر رو انتخاب کن:", reply_markup=build_keyword_list_markup(rows))
+    await callback.answer("حذف شد ✅")
+
+
+@dp.callback_query(F.data == "kwback")
+async def on_keyword_back(callback: CallbackQuery):
+    if callback.from_user.id != OWNER_ID:
+        await callback.answer("⛔", show_alert=True)
+        return
+
+    conn = db()
+    rows = conn.execute("SELECT id, keyword, reply_text FROM keywords ORDER BY id").fetchall()
+    conn.close()
+
+    if not rows:
+        await callback.message.edit_text("هنوز کیوردی ثبت نشده.")
+    else:
+        await callback.message.edit_text("کیورد مورد نظر رو انتخاب کن:", reply_markup=build_keyword_list_markup(rows))
+    await callback.answer()
+
+
 @dp.message(Command("backup"))
 async def cmd_backup(message: Message):
     if message.from_user.id != OWNER_ID:
