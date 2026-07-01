@@ -72,6 +72,13 @@ def db():
             reply_text TEXT NOT NULL
         )
     """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS topics (
+            chat_id INTEGER PRIMARY KEY,
+            topic_id INTEGER NOT NULL,
+            chat_name TEXT
+        )
+    """)
     return conn
 
 
@@ -90,6 +97,23 @@ def sender_display_name(message: Message) -> str:
         return "?"
     parts = [p for p in [u.first_name, u.last_name] if p]
     return " ".join(parts) if parts else (u.username or str(u.id))
+
+
+async def get_or_create_topic(chat_id: int, chat_name: str) -> int:
+    conn = db()
+    row = conn.execute("SELECT topic_id FROM topics WHERE chat_id = ?", (chat_id,)).fetchone()
+    if row:
+        conn.close()
+        return row[0]
+
+    topic = await bot.create_forum_topic(chat_id=BACKUP_GROUP_ID, name=chat_name[:128])
+    conn.execute(
+        "INSERT INTO topics (chat_id, topic_id, chat_name) VALUES (?, ?, ?)",
+        (chat_id, topic.message_thread_id, chat_name),
+    )
+    conn.commit()
+    conn.close()
+    return topic.message_thread_id
 
 
 @dp.business_connection()
@@ -146,34 +170,50 @@ async def on_business_message(message: Message):
     conn.commit()
     conn.close()
 
+    try:
+        thread_id = await get_or_create_topic(message.chat.id, chat_display_name(message))
+    except Exception as e:
+        logging.error(f"Failed to get/create topic: {e}")
+        thread_id = None
+
+    sender_label = sender_display_name(message) + (
+        f" (@{message.from_user.username})" if message.from_user and message.from_user.username else ""
+    )
+
     if media_type and file_id:
-        caption = (
-            f"{chat_display_name(message)} (ID: {message.chat.id})\n"
-            f"از: {sender_display_name(message)}"
-            + (f" (@{message.from_user.username})" if message.from_user and message.from_user.username else "")
-            + (f"\n{text}" if text else "")
-        )
+        caption = f"از: {sender_label}" + (f"\n{text}" if text else "")
         send_map = {
             "photo": bot.send_photo,
             "video": bot.send_video,
             "voice": bot.send_voice,
             "audio": bot.send_audio,
             "document": bot.send_document,
-            "video_note": None,
-            "sticker": bot.send_sticker,
             "animation": bot.send_animation,
         }
         try:
-            if media_type == "video_note":
-                await bot.send_video_note(chat_id=BACKUP_GROUP_ID, video_note=file_id)
-                await bot.send_message(chat_id=BACKUP_GROUP_ID, text=caption)
+            if thread_id is None:
+                pass
+            elif media_type == "video_note":
+                await bot.send_video_note(chat_id=BACKUP_GROUP_ID, video_note=file_id, message_thread_id=thread_id)
+                await bot.send_message(chat_id=BACKUP_GROUP_ID, text=caption, message_thread_id=thread_id)
             elif media_type == "sticker":
-                await bot.send_sticker(chat_id=BACKUP_GROUP_ID, sticker=file_id)
-                await bot.send_message(chat_id=BACKUP_GROUP_ID, text=caption)
+                await bot.send_sticker(chat_id=BACKUP_GROUP_ID, sticker=file_id, message_thread_id=thread_id)
+                await bot.send_message(chat_id=BACKUP_GROUP_ID, text=caption, message_thread_id=thread_id)
             else:
-                await send_map[media_type](chat_id=BACKUP_GROUP_ID, **{media_type: file_id}, caption=caption)
+                await send_map[media_type](
+                    chat_id=BACKUP_GROUP_ID, **{media_type: file_id}, caption=caption, message_thread_id=thread_id
+                )
         except Exception as e:
             logging.error(f"Failed to relay media: {e}")
+    elif text and thread_id is not None:
+        try:
+            await bot.send_message(
+                chat_id=BACKUP_GROUP_ID,
+                text=f"از: {sender_label}\n{text}",
+                message_thread_id=thread_id,
+            )
+        except Exception as e:
+            logging.error(f"Failed to relay text: {e}")
 
     if text and (not message.from_user or message.from_user.id != OWNER_ID):
         kconn = db()
