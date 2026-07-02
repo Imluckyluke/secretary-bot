@@ -70,12 +70,9 @@ def db():
     msg_cols = [r[1] for r in conn.execute("PRAGMA table_info(messages)").fetchall()]
     if "business_connection_id" not in msg_cols:
         conn.execute("ALTER TABLE messages ADD COLUMN business_connection_id TEXT")
-    if "owner_user_id" not in msg_cols:
-        conn.execute("ALTER TABLE messages ADD COLUMN owner_user_id INTEGER")
 
     conn.execute("CREATE INDEX IF NOT EXISTS idx_chat ON messages(chat_id)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_conn ON messages(business_connection_id)")
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_owner ON messages(owner_user_id)")
 
     conn.execute("""
         CREATE TABLE IF NOT EXISTS keywords (
@@ -100,14 +97,6 @@ def db():
         )
     """)
 
-    # backfill owner_user_id on messages for rows written before this column existed
-    conn.execute("""
-        UPDATE messages SET owner_user_id = (
-            SELECT user_id FROM connections WHERE connections.business_connection_id = messages.business_connection_id
-        )
-        WHERE owner_user_id IS NULL AND business_connection_id IS NOT NULL
-    """)
-
     conn.execute("""
         CREATE TABLE IF NOT EXISTS home_groups (
             user_id INTEGER PRIMARY KEY,
@@ -117,41 +106,36 @@ def db():
         )
     """)
 
-    # topics / backup_topics are keyed by owner_user_id (stable per real account),
-    # not business_connection_id (which changes if the account reconnects the bot).
     topic_cols = [r[1] for r in conn.execute("PRAGMA table_info(topics)").fetchall()]
-    if topic_cols and "owner_user_id" not in topic_cols:
+    if topic_cols and "business_connection_id" not in topic_cols:
         conn.execute("ALTER TABLE topics RENAME TO topics_legacy")
         topic_cols = []
     if not topic_cols:
         conn.execute("""
             CREATE TABLE IF NOT EXISTS topics (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                owner_user_id INTEGER NOT NULL,
+                business_connection_id TEXT NOT NULL,
                 chat_id INTEGER NOT NULL,
                 home_chat_id INTEGER NOT NULL,
                 topic_id INTEGER NOT NULL,
                 chat_name TEXT,
-                UNIQUE(owner_user_id, chat_id)
+                UNIQUE(business_connection_id, chat_id)
             )
         """)
+    elif "home_chat_id" not in topic_cols:
+        conn.execute("ALTER TABLE topics ADD COLUMN home_chat_id INTEGER")
 
-    backup_topic_cols = [r[1] for r in conn.execute("PRAGMA table_info(backup_topics)").fetchall()]
-    if backup_topic_cols and "owner_user_id" not in backup_topic_cols:
-        conn.execute("ALTER TABLE backup_topics RENAME TO backup_topics_legacy")
-        backup_topic_cols = []
-    if not backup_topic_cols:
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS backup_topics (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                owner_user_id INTEGER NOT NULL,
-                chat_id INTEGER NOT NULL,
-                home_chat_id INTEGER NOT NULL,
-                topic_id INTEGER NOT NULL,
-                chat_name TEXT,
-                UNIQUE(owner_user_id, chat_id)
-            )
-        """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS backup_topics (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            business_connection_id TEXT NOT NULL,
+            chat_id INTEGER NOT NULL,
+            home_chat_id INTEGER NOT NULL,
+            topic_id INTEGER NOT NULL,
+            chat_name TEXT,
+            UNIQUE(business_connection_id, chat_id)
+        )
+    """)
 
     return conn
 
@@ -209,17 +193,17 @@ def is_authorized_in_group(message: Message) -> bool:
     return owner_user_id is not None and message.from_user.id == owner_user_id
 
 
-def connection_display_name(owner_user_id: int) -> str:
+def connection_display_name(business_connection_id: str) -> str:
     conn = db()
     row = conn.execute(
-        "SELECT display_name, username FROM connections WHERE user_id = ? ORDER BY connected_at DESC LIMIT 1",
-        (owner_user_id,),
+        "SELECT display_name, username FROM connections WHERE business_connection_id = ?",
+        (business_connection_id,),
     ).fetchone()
     conn.close()
     if not row:
-        return str(owner_user_id)
+        return business_connection_id
     display_name, username = row
-    return display_name or (f"@{username}" if username else str(owner_user_id))
+    return display_name or (f"@{username}" if username else business_connection_id)
 
 
 def chat_display_name(message: Message) -> str:
@@ -239,60 +223,61 @@ def sender_display_name(message: Message) -> str:
     return " ".join(parts) if parts else (u.username or str(u.id))
 
 
-async def get_or_create_topic(owner_user_id: int, chat_id: int, chat_name: str):
+async def get_or_create_topic(business_connection_id: str, chat_id: int, chat_name: str):
+    owner_user_id = connection_owner_user_id(business_connection_id)
     home_chat_id = get_home_chat_id(owner_user_id) if owner_user_id else None
     if home_chat_id is None:
         return None, None
 
     conn = db()
     row = conn.execute(
-        "SELECT topic_id, home_chat_id FROM topics WHERE owner_user_id = ? AND chat_id = ?",
-        (owner_user_id, chat_id),
+        "SELECT topic_id, home_chat_id FROM topics WHERE business_connection_id = ? AND chat_id = ?",
+        (business_connection_id, chat_id),
     ).fetchone()
     if row and row[1] == home_chat_id:
         conn.close()
         return row[0], home_chat_id
 
-    acc_name = connection_display_name(owner_user_id)
+    acc_name = connection_display_name(business_connection_id)
     topic_name = f"{acc_name} — {chat_name}"[:128]
     topic = await bot.create_forum_topic(chat_id=home_chat_id, name=topic_name)
     conn.execute(
         """
-        INSERT INTO topics (owner_user_id, chat_id, home_chat_id, topic_id, chat_name) VALUES (?, ?, ?, ?, ?)
-        ON CONFLICT(owner_user_id, chat_id) DO UPDATE SET
+        INSERT INTO topics (business_connection_id, chat_id, home_chat_id, topic_id, chat_name) VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT(business_connection_id, chat_id) DO UPDATE SET
             home_chat_id=excluded.home_chat_id, topic_id=excluded.topic_id, chat_name=excluded.chat_name
         """,
-        (owner_user_id, chat_id, home_chat_id, topic.message_thread_id, chat_name),
+        (business_connection_id, chat_id, home_chat_id, topic.message_thread_id, chat_name),
     )
     conn.commit()
     conn.close()
     return topic.message_thread_id, home_chat_id
 
 
-async def get_or_create_backup_topic(owner_user_id: int, chat_id: int, chat_name: str):
+async def get_or_create_backup_topic(business_connection_id: str, chat_id: int, chat_name: str):
     supervisor_chat_id = get_home_chat_id(OWNER_ID)
     if supervisor_chat_id is None:
         return None, None
 
     conn = db()
     row = conn.execute(
-        "SELECT topic_id FROM backup_topics WHERE owner_user_id = ? AND chat_id = ? AND home_chat_id = ?",
-        (owner_user_id, chat_id, supervisor_chat_id),
+        "SELECT topic_id FROM backup_topics WHERE business_connection_id = ? AND chat_id = ? AND home_chat_id = ?",
+        (business_connection_id, chat_id, supervisor_chat_id),
     ).fetchone()
     if row:
         conn.close()
         return row[0], supervisor_chat_id
 
-    acc_name = connection_display_name(owner_user_id)
+    acc_name = connection_display_name(business_connection_id)
     topic_name = f"{acc_name} — {chat_name}"[:128]
     topic = await bot.create_forum_topic(chat_id=supervisor_chat_id, name=topic_name)
     conn.execute(
         """
-        INSERT INTO backup_topics (owner_user_id, chat_id, home_chat_id, topic_id, chat_name) VALUES (?, ?, ?, ?, ?)
-        ON CONFLICT(owner_user_id, chat_id) DO UPDATE SET
+        INSERT INTO backup_topics (business_connection_id, chat_id, home_chat_id, topic_id, chat_name) VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT(business_connection_id, chat_id) DO UPDATE SET
             home_chat_id=excluded.home_chat_id, topic_id=excluded.topic_id, chat_name=excluded.chat_name
         """,
-        (owner_user_id, chat_id, supervisor_chat_id, topic.message_thread_id, chat_name),
+        (business_connection_id, chat_id, supervisor_chat_id, topic.message_thread_id, chat_name),
     )
     conn.commit()
     conn.close()
@@ -308,7 +293,6 @@ async def on_business_connection(business_conn: BusinessConnection):
     display_name = " ".join(parts) if parts else (user.username or str(user.id))
 
     conn = db()
-    existed = conn.execute("SELECT 1 FROM connections WHERE user_id = ?", (user.id,)).fetchone()
     conn.execute(
         """
         INSERT INTO connections (business_connection_id, user_id, display_name, username, is_enabled, connected_at)
@@ -331,9 +315,6 @@ async def on_business_connection(business_conn: BusinessConnection):
     )
     conn.commit()
     conn.close()
-
-    if existed:
-        return
 
     notify_chat_id = get_home_chat_id(user.id) or get_home_chat_id(OWNER_ID)
     if notify_chat_id:
@@ -417,11 +398,9 @@ async def on_business_message(message: Message):
         media_type = "animation"
         file_id = message.animation.file_id
 
-    owner_user_id = connection_owner_user_id(message.business_connection_id)
-
     conn = db()
     conn.execute(
-        "INSERT INTO messages (chat_id, chat_name, sender_id, sender_name, sender_username, text, media_type, file_id, ts, business_connection_id, owner_user_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "INSERT INTO messages (chat_id, chat_name, sender_id, sender_name, sender_username, text, media_type, file_id, ts, business_connection_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (
             message.chat.id,
             chat_display_name(message),
@@ -433,19 +412,19 @@ async def on_business_message(message: Message):
             file_id,
             message.date.isoformat() if message.date else datetime.utcnow().isoformat(),
             message.business_connection_id,
-            owner_user_id,
         ),
     )
     conn.commit()
     conn.close()
 
     try:
-        thread_id, home_chat_id = await get_or_create_topic(owner_user_id, message.chat.id, chat_display_name(message))
+        thread_id, home_chat_id = await get_or_create_topic(message.business_connection_id, message.chat.id, chat_display_name(message))
     except Exception as e:
         logging.error(f"Failed to get/create topic: {e}")
         thread_id, home_chat_id = None, None
 
-    if message.from_user and owner_user_id and message.from_user.id == owner_user_id:
+    conn_owner_user_id = connection_owner_user_id(message.business_connection_id)
+    if message.from_user and conn_owner_user_id and message.from_user.id == conn_owner_user_id:
         sender_label = "شما"
     else:
         sender_label = sender_display_name(message) + (
@@ -488,6 +467,7 @@ async def on_business_message(message: Message):
             logging.error(f"Failed to relay text: {e}")
 
     if text and (not message.from_user or not is_self_account(message.from_user.id)):
+        owner_user_id = connection_owner_user_id(message.business_connection_id)
         kconn = db()
         krows = kconn.execute(
             "SELECT keyword, reply_text FROM keywords WHERE owner_user_id = ?", (owner_user_id,)
@@ -706,33 +686,17 @@ async def on_keyword_back(callback: CallbackQuery):
 
 def build_accounts_markup(rows):
     builder = InlineKeyboardBuilder()
-    for owner_user_id, display_name in rows:
-        builder.row(InlineKeyboardButton(text=display_name, callback_data=f"bkacc:{owner_user_id}"))
+    for business_connection_id, display_name in rows:
+        builder.row(InlineKeyboardButton(text=display_name, callback_data=f"bkacc:{business_connection_id}"))
     return builder.as_markup()
 
 
-def build_backup_chats_markup(owner_user_id: int, chats):
+def build_backup_chats_markup(business_connection_id: str, chats):
     builder = InlineKeyboardBuilder()
     for chat_id, chat_name in chats:
-        builder.row(InlineKeyboardButton(text=chat_name, callback_data=f"backup:{owner_user_id}|{chat_id}"))
+        builder.row(InlineKeyboardButton(text=chat_name, callback_data=f"backup:{business_connection_id}|{chat_id}"))
     builder.row(InlineKeyboardButton(text="⬅️ لیست اکانت‌ها", callback_data="bkback"))
     return builder.as_markup()
-
-
-def get_backup_accounts():
-    conn = db()
-    accounts = conn.execute(
-        """
-        SELECT DISTINCT m.owner_user_id
-        FROM messages m
-        WHERE m.owner_user_id IS NOT NULL AND m.owner_user_id != ?
-        """,
-        (OWNER_ID,),
-    ).fetchall()
-    conn.close()
-    result = [(row[0], connection_display_name(row[0])) for row in accounts]
-    result.sort(key=lambda r: r[1].lower())
-    return result
 
 
 @dp.message(Command("backup"))
@@ -742,24 +706,36 @@ async def cmd_backup(message: Message):
     if message.chat.id != get_home_chat_id(OWNER_ID):
         return
 
-    accounts = get_backup_accounts()
+    conn = db()
+    accounts = conn.execute(
+        """
+        SELECT DISTINCT m.business_connection_id, COALESCE(c.display_name, m.business_connection_id)
+        FROM messages m
+        LEFT JOIN connections c ON c.business_connection_id = m.business_connection_id
+        WHERE m.business_connection_id IS NOT NULL AND (c.user_id IS NULL OR c.user_id != ?)
+        ORDER BY 2 COLLATE NOCASE
+        """,
+        (OWNER_ID,),
+    ).fetchall()
+    conn.close()
 
     if not accounts:
         await message.answer("پیامی از ساب‌اکانتی ذخیره نشده.")
         return
 
     if len(accounts) == 1:
-        await show_backup_chats(message, accounts[0][0])
+        business_connection_id = accounts[0][0]
+        await show_backup_chats(message, business_connection_id)
         return
 
     await message.answer("اکانت مورد نظر رو انتخاب کن:", reply_markup=build_accounts_markup(accounts))
 
 
-async def show_backup_chats(target, owner_user_id: int):
+async def show_backup_chats(target, business_connection_id: str):
     conn = db()
     chats = conn.execute(
-        "SELECT DISTINCT chat_id, chat_name FROM messages WHERE owner_user_id = ? ORDER BY chat_name COLLATE NOCASE",
-        (owner_user_id,),
+        "SELECT DISTINCT chat_id, chat_name FROM messages WHERE business_connection_id = ? ORDER BY chat_name COLLATE NOCASE",
+        (business_connection_id,),
     ).fetchall()
     conn.close()
 
@@ -767,8 +743,8 @@ async def show_backup_chats(target, owner_user_id: int):
         await target.answer("پیامی برای این اکانت یافت نشد.")
         return
 
-    markup = build_backup_chats_markup(owner_user_id, chats)
-    acc_name = connection_display_name(owner_user_id)
+    markup = build_backup_chats_markup(business_connection_id, chats)
+    acc_name = connection_display_name(business_connection_id)
     text = f"کاربر مورد نظر رو انتخاب کن ({acc_name}):"
     if isinstance(target, Message):
         await target.answer(text, reply_markup=markup)
@@ -781,8 +757,8 @@ async def on_account_click(callback: CallbackQuery):
     if callback.from_user.id != OWNER_ID:
         await callback.answer("⛔", show_alert=True)
         return
-    owner_user_id = int(callback.data.split(":", 1)[1])
-    await show_backup_chats(callback.message, owner_user_id)
+    business_connection_id = callback.data.split(":", 1)[1]
+    await show_backup_chats(callback.message, business_connection_id)
     await callback.answer()
 
 
@@ -792,7 +768,18 @@ async def on_backup_back(callback: CallbackQuery):
         await callback.answer("⛔", show_alert=True)
         return
 
-    accounts = get_backup_accounts()
+    conn = db()
+    accounts = conn.execute(
+        """
+        SELECT DISTINCT m.business_connection_id, COALESCE(c.display_name, m.business_connection_id)
+        FROM messages m
+        LEFT JOIN connections c ON c.business_connection_id = m.business_connection_id
+        WHERE m.business_connection_id IS NOT NULL AND (c.user_id IS NULL OR c.user_id != ?)
+        ORDER BY 2 COLLATE NOCASE
+        """,
+        (OWNER_ID,),
+    ).fetchall()
+    conn.close()
 
     if not accounts:
         await callback.message.edit_text("پیامی از ساب‌اکانتی ذخیره نشده.")
@@ -808,14 +795,13 @@ async def on_backup_click(callback: CallbackQuery):
         return
 
     payload = callback.data.split(":", 1)[1]
-    owner_user_id_str, chat_id_str = payload.rsplit("|", 1)
-    owner_user_id = int(owner_user_id_str)
+    business_connection_id, chat_id_str = payload.rsplit("|", 1)
     chat_id = int(chat_id_str)
 
     conn = db()
     rows = conn.execute(
-        "SELECT chat_name, sender_name, sender_username, text, media_type, ts, file_id FROM messages WHERE owner_user_id = ? AND chat_id = ? ORDER BY ts",
-        (owner_user_id, chat_id),
+        "SELECT chat_name, sender_name, sender_username, text, media_type, ts, file_id FROM messages WHERE business_connection_id = ? AND chat_id = ? ORDER BY ts",
+        (business_connection_id, chat_id),
     ).fetchall()
     conn.close()
 
@@ -823,7 +809,7 @@ async def on_backup_click(callback: CallbackQuery):
         await callback.answer("پیامی یافت نشد.", show_alert=True)
         return
 
-    acc_name = connection_display_name(owner_user_id)
+    acc_name = connection_display_name(business_connection_id)
     chat_name = rows[0][0]
     lines = [f"===== {acc_name} | {chat_name} (ID: {chat_id}) ====="]
     for _, sender_name, sender_username, text, media_type, ts, _ in rows:
@@ -835,7 +821,7 @@ async def on_backup_click(callback: CallbackQuery):
         content = f"[{media_type}] {text}".strip() if media_type else text
         lines.append(f"[{ts_fmt}] {sender_name}{uname}: {content}")
 
-    safe_acc = "".join(c for c in acc_name if c.isalnum() or c in " _-").strip() or str(owner_user_id)
+    safe_acc = "".join(c for c in acc_name if c.isalnum() or c in " _-").strip() or business_connection_id
     safe_name = "".join(c for c in chat_name if c.isalnum() or c in " _-").strip() or str(chat_id)
     filename = f"backup_{safe_acc}_{safe_name}_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.txt"
     filepath = f"/tmp/{filename}"
@@ -859,7 +845,7 @@ async def on_backup_click(callback: CallbackQuery):
     media_rows = [r for r in rows if r[4] and r[6]]
     if media_rows:
         try:
-            topic_id, mgmt_chat_id = await get_or_create_backup_topic(owner_user_id, chat_id, chat_name)
+            topic_id, mgmt_chat_id = await get_or_create_backup_topic(business_connection_id, chat_id, chat_name)
         except Exception as e:
             logging.error(f"Failed to get/create backup topic: {e}")
             topic_id, mgmt_chat_id = None, None
