@@ -180,6 +180,14 @@ def _init_db_sync():
             )
         """)
 
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS unified_media_topic (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            home_chat_id INTEGER NOT NULL,
+            topic_id INTEGER NOT NULL
+        )
+    """)
+
     conn.commit()
     conn.close()
 
@@ -385,6 +393,10 @@ async def safe_send_media(chat_id: int, media_type: str, file_id: str, caption: 
 async def get_or_create_topic(owner_user_id: int, chat_id: int, chat_name: str):
     home_chat_id = await get_home_chat_id(owner_user_id) if owner_user_id else None
     if home_chat_id is None:
+        logging.warning(
+            f"get_or_create_topic: no home_chat_id for owner_user_id={owner_user_id} "
+            f"(chat_id={chat_id}) — topic/relay skipped"
+        )
         return None, None
 
     def _select(conn):
@@ -419,37 +431,36 @@ async def get_or_create_topic(owner_user_id: int, chat_id: int, chat_name: str):
     return topic.message_thread_id, home_chat_id
 
 
-async def get_or_create_backup_topic(owner_user_id: int, chat_id: int, chat_name: str):
+async def get_or_create_unified_media_topic():
+    """Single shared topic (in the owner's supervisor group) that receives
+    live media from ALL sub-accounts as it arrives. Created once and reused
+    forever — never recreated, never touched by /backup."""
     supervisor_chat_id = await get_home_chat_id(OWNER_ID)
     if supervisor_chat_id is None:
         return None, None
 
     def _select(conn):
         return conn.execute(
-            "SELECT topic_id FROM backup_topics WHERE owner_user_id = ? AND chat_id = ? AND home_chat_id = ?",
-            (owner_user_id, chat_id, supervisor_chat_id),
+            "SELECT topic_id, home_chat_id FROM unified_media_topic WHERE id = 1"
         ).fetchone()
 
     row = await run_db(_select)
-    if row:
+    if row and row[1] == supervisor_chat_id:
         return row[0], supervisor_chat_id
 
-    acc_name = await connection_display_name(owner_user_id)
-    topic_name = f"{acc_name} — {chat_name}"[:128]
     try:
-        topic = await bot.create_forum_topic(chat_id=supervisor_chat_id, name=topic_name)
+        topic = await bot.create_forum_topic(chat_id=supervisor_chat_id, name="📎 رسانه همه اکانت‌ها")
     except TelegramBadRequest as e:
-        logging.error(f"Failed to create backup topic in {supervisor_chat_id}: {e}")
+        logging.error(f"Failed to create unified media topic in {supervisor_chat_id}: {e}")
         return None, None
 
     def _upsert(conn):
         conn.execute(
             """
-            INSERT INTO backup_topics (owner_user_id, chat_id, home_chat_id, topic_id, chat_name) VALUES (?, ?, ?, ?, ?)
-            ON CONFLICT(owner_user_id, chat_id) DO UPDATE SET
-                home_chat_id=excluded.home_chat_id, topic_id=excluded.topic_id, chat_name=excluded.chat_name
+            INSERT INTO unified_media_topic (id, home_chat_id, topic_id) VALUES (1, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET home_chat_id=excluded.home_chat_id, topic_id=excluded.topic_id
             """,
-            (owner_user_id, chat_id, supervisor_chat_id, topic.message_thread_id, chat_name),
+            (supervisor_chat_id, topic.message_thread_id),
         )
 
     await run_db(_upsert)
@@ -580,6 +591,10 @@ async def on_business_message(message: Message):
         file_id = message.animation.file_id
 
     owner_user_id = await connection_owner_user_id(message.business_connection_id)
+    logging.info(
+        f"business_message: business_connection_id={message.business_connection_id} "
+        f"resolved owner_user_id={owner_user_id} chat_id={message.chat.id}"
+    )
 
     def _insert(conn):
         conn.execute(
@@ -618,6 +633,20 @@ async def on_business_message(message: Message):
         caption = f"از: {sender_label}" + (f"\n{text}" if text else "")
         if thread_id is not None:
             await safe_send_media(home_chat_id, media_type, file_id, caption, thread_id)
+
+        if owner_user_id and owner_user_id != OWNER_ID:
+            try:
+                umt_id, umt_chat_id = await get_or_create_unified_media_topic()
+            except Exception as e:
+                logging.error(f"Failed to get/create unified media topic: {e}")
+                umt_id, umt_chat_id = None, None
+            if umt_id is not None:
+                acc_name = await connection_display_name(owner_user_id)
+                unified_caption = (
+                    f"👤 {acc_name}\n💬 {chat_display_name(message)}\nاز: {sender_label}"
+                    + (f"\n{text}" if text else "")
+                )
+                await safe_send_media(umt_chat_id, media_type, file_id, unified_caption, umt_id)
     elif text and thread_id is not None:
         await safe_send_message(
             chat_id=home_chat_id,
@@ -871,8 +900,9 @@ async def get_backup_accounts():
             """
             SELECT DISTINCT m.owner_user_id
             FROM messages m
-            WHERE m.owner_user_id IS NOT NULL
-            """
+            WHERE m.owner_user_id IS NOT NULL AND m.owner_user_id != ?
+            """,
+            (OWNER_ID,),
         ).fetchall()
 
     accounts = await run_db(_q)
@@ -1026,18 +1056,9 @@ async def on_backup_click(callback: CallbackQuery):
         except OSError:
             pass
 
-    media_rows = [r for r in rows if r[4] and r[6]]
-    if media_rows:
-        try:
-            topic_id, mgmt_chat_id = await get_or_create_backup_topic(owner_user_id, chat_id, chat_name)
-        except Exception as e:
-            logging.error(f"Failed to get/create backup topic: {e}")
-            topic_id, mgmt_chat_id = None, None
-
-        if topic_id is not None:
-            for _, _, _, _, media_type, _, file_id in media_rows:
-                caption = f"از: {acc_name}"
-                await safe_send_media(mgmt_chat_id, media_type, file_id, caption, topic_id)
+    # Media is already relayed live into the unified media topic as it
+    # arrives (see on_business_message) — /backup only sends the text file
+    # and does not resend media or create/touch any topic.
 
     await callback.answer("ارسال شد ✅")
 
