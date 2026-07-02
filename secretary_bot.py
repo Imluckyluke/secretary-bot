@@ -871,9 +871,8 @@ async def get_backup_accounts():
             """
             SELECT DISTINCT m.owner_user_id
             FROM messages m
-            WHERE m.owner_user_id IS NOT NULL AND m.owner_user_id != ?
-            """,
-            (OWNER_ID,),
+            WHERE m.owner_user_id IS NOT NULL
+            """
         ).fetchall()
 
     accounts = await run_db(_q)
