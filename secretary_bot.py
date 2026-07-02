@@ -125,6 +125,18 @@ def db():
     elif "home_chat_id" not in topic_cols:
         conn.execute("ALTER TABLE topics ADD COLUMN home_chat_id INTEGER")
 
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS backup_topics (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            business_connection_id TEXT NOT NULL,
+            chat_id INTEGER NOT NULL,
+            home_chat_id INTEGER NOT NULL,
+            topic_id INTEGER NOT NULL,
+            chat_name TEXT,
+            UNIQUE(business_connection_id, chat_id)
+        )
+    """)
+
     return conn
 
 
@@ -240,6 +252,36 @@ async def get_or_create_topic(business_connection_id: str, chat_id: int, chat_na
     conn.commit()
     conn.close()
     return topic.message_thread_id, home_chat_id
+
+
+async def get_or_create_backup_topic(business_connection_id: str, chat_id: int, chat_name: str):
+    supervisor_chat_id = get_home_chat_id(OWNER_ID)
+    if supervisor_chat_id is None:
+        return None, None
+
+    conn = db()
+    row = conn.execute(
+        "SELECT topic_id FROM backup_topics WHERE business_connection_id = ? AND chat_id = ? AND home_chat_id = ?",
+        (business_connection_id, chat_id, supervisor_chat_id),
+    ).fetchone()
+    if row:
+        conn.close()
+        return row[0], supervisor_chat_id
+
+    acc_name = connection_display_name(business_connection_id)
+    topic_name = f"{acc_name} — {chat_name}"[:128]
+    topic = await bot.create_forum_topic(chat_id=supervisor_chat_id, name=topic_name)
+    conn.execute(
+        """
+        INSERT INTO backup_topics (business_connection_id, chat_id, home_chat_id, topic_id, chat_name) VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT(business_connection_id, chat_id) DO UPDATE SET
+            home_chat_id=excluded.home_chat_id, topic_id=excluded.topic_id, chat_name=excluded.chat_name
+        """,
+        (business_connection_id, chat_id, supervisor_chat_id, topic.message_thread_id, chat_name),
+    )
+    conn.commit()
+    conn.close()
+    return topic.message_thread_id, supervisor_chat_id
 
 
 @dp.business_connection()
@@ -381,9 +423,13 @@ async def on_business_message(message: Message):
         logging.error(f"Failed to get/create topic: {e}")
         thread_id, home_chat_id = None, None
 
-    sender_label = sender_display_name(message) + (
-        f" (@{message.from_user.username})" if message.from_user and message.from_user.username else ""
-    )
+    conn_owner_user_id = connection_owner_user_id(message.business_connection_id)
+    if message.from_user and conn_owner_user_id and message.from_user.id == conn_owner_user_id:
+        sender_label = "شما"
+    else:
+        sender_label = sender_display_name(message) + (
+            f" (@{message.from_user.username})" if message.from_user and message.from_user.username else ""
+        )
 
     if media_type and file_id:
         caption = f"از: {sender_label}" + (f"\n{text}" if text else "")
@@ -666,14 +712,15 @@ async def cmd_backup(message: Message):
         SELECT DISTINCT m.business_connection_id, COALESCE(c.display_name, m.business_connection_id)
         FROM messages m
         LEFT JOIN connections c ON c.business_connection_id = m.business_connection_id
-        WHERE m.business_connection_id IS NOT NULL
+        WHERE m.business_connection_id IS NOT NULL AND (c.user_id IS NULL OR c.user_id != ?)
         ORDER BY 2 COLLATE NOCASE
-        """
+        """,
+        (OWNER_ID,),
     ).fetchall()
     conn.close()
 
     if not accounts:
-        await message.answer("هنوز پیامی ذخیره نشده.")
+        await message.answer("پیامی از ساب‌اکانتی ذخیره نشده.")
         return
 
     if len(accounts) == 1:
@@ -727,14 +774,15 @@ async def on_backup_back(callback: CallbackQuery):
         SELECT DISTINCT m.business_connection_id, COALESCE(c.display_name, m.business_connection_id)
         FROM messages m
         LEFT JOIN connections c ON c.business_connection_id = m.business_connection_id
-        WHERE m.business_connection_id IS NOT NULL
+        WHERE m.business_connection_id IS NOT NULL AND (c.user_id IS NULL OR c.user_id != ?)
         ORDER BY 2 COLLATE NOCASE
-        """
+        """,
+        (OWNER_ID,),
     ).fetchall()
     conn.close()
 
     if not accounts:
-        await callback.message.edit_text("هنوز پیامی ذخیره نشده.")
+        await callback.message.edit_text("پیامی از ساب‌اکانتی ذخیره نشده.")
     else:
         await callback.message.edit_text("اکانت مورد نظر رو انتخاب کن:", reply_markup=build_accounts_markup(accounts))
     await callback.answer()
@@ -752,7 +800,7 @@ async def on_backup_click(callback: CallbackQuery):
 
     conn = db()
     rows = conn.execute(
-        "SELECT chat_name, sender_name, sender_username, text, media_type, ts FROM messages WHERE business_connection_id = ? AND chat_id = ? ORDER BY ts",
+        "SELECT chat_name, sender_name, sender_username, text, media_type, ts, file_id FROM messages WHERE business_connection_id = ? AND chat_id = ? ORDER BY ts",
         (business_connection_id, chat_id),
     ).fetchall()
     conn.close()
@@ -764,7 +812,7 @@ async def on_backup_click(callback: CallbackQuery):
     acc_name = connection_display_name(business_connection_id)
     chat_name = rows[0][0]
     lines = [f"===== {acc_name} | {chat_name} (ID: {chat_id}) ====="]
-    for _, sender_name, sender_username, text, media_type, ts in rows:
+    for _, sender_name, sender_username, text, media_type, ts, _ in rows:
         try:
             ts_fmt = datetime.fromisoformat(ts).strftime("%Y-%m-%d %H:%M")
         except ValueError:
@@ -785,6 +833,41 @@ async def on_backup_click(callback: CallbackQuery):
         document=FSInputFile(filepath, filename=filename),
         caption=f"بکاپ {acc_name} | {chat_name} — {len(rows)} پیام",
     )
+
+    send_map = {
+        "photo": bot.send_photo,
+        "video": bot.send_video,
+        "voice": bot.send_voice,
+        "audio": bot.send_audio,
+        "document": bot.send_document,
+        "animation": bot.send_animation,
+    }
+    media_rows = [r for r in rows if r[4] and r[6]]
+    if media_rows:
+        try:
+            topic_id, mgmt_chat_id = await get_or_create_backup_topic(business_connection_id, chat_id, chat_name)
+        except Exception as e:
+            logging.error(f"Failed to get/create backup topic: {e}")
+            topic_id, mgmt_chat_id = None, None
+
+        for _, _, _, _, media_type, _, file_id in media_rows:
+            caption = f"از: {acc_name}"
+            try:
+                if topic_id is None:
+                    pass
+                elif media_type == "video_note":
+                    await bot.send_video_note(chat_id=mgmt_chat_id, video_note=file_id, message_thread_id=topic_id)
+                    await bot.send_message(chat_id=mgmt_chat_id, text=caption, message_thread_id=topic_id)
+                elif media_type == "sticker":
+                    await bot.send_sticker(chat_id=mgmt_chat_id, sticker=file_id, message_thread_id=topic_id)
+                    await bot.send_message(chat_id=mgmt_chat_id, text=caption, message_thread_id=topic_id)
+                else:
+                    await send_map[media_type](
+                        chat_id=mgmt_chat_id, **{media_type: file_id}, caption=caption, message_thread_id=topic_id
+                    )
+            except Exception as e:
+                logging.error(f"Failed to forward backup media: {e}")
+
     await callback.answer("ارسال شد ✅")
 
 
